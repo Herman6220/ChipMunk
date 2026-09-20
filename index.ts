@@ -10,19 +10,24 @@ const bytes = new Uint8Array(await torrentFile.arrayBuffer());
 
 const decoded = bencode.decode(bytes);
 
-const announceUrl = new URL("udp://tracker.opentrackr.org:1337");
+
+const decodedAnnounceUrl = new URL(decoded.announce);
 // console.log(decoded);
+const decodedAnnounceUrlList: URL[] = decoded["announce-list"].flat().map((prev: string) => new URL(prev));
+const announceUrlList: URL[] = [decodedAnnounceUrl, ...decodedAnnounceUrlList];
+console.log(announceUrlList);
+
 
 const PORT = 41234;
-const transactionId = crypto.randomBytes(4).readUInt32BE(0);
+let transactionId: number;
 const key = crypto.randomBytes(4).readUInt32BE(0);
 let connectionId: bigint;
 
-const genConnectionRequest = () => {
+const genConnectionRequest = (tId: number) => {
     const buf = Buffer.alloc(16);
     buf.writeBigUInt64BE(PROTOCOL_ID, 0);
-    buf.writeUInt32BE(0, 8);
-    buf.writeUInt32BE(transactionId, 12);
+    buf.writeUInt32BE(0, 8); // announce   0 // 0: connect
+    buf.writeUInt32BE(tId, 12); // tId = transactionId
     return buf;
 }
 
@@ -50,7 +55,7 @@ const genAnnounceRequest = () => {
 
     const buf = Buffer.alloc(98);
     buf.writeBigUInt64BE(connectionId, 0); // connection
-    buf.writeUint32BE(1, 8); // action: 1 / announce 
+    buf.writeUint32BE(1, 8); // action   1 // 1: announce 
     buf.writeUint32BE(transactionId, 12);
     infoHash.copy(buf, 16);
     peerId.copy(buf, 36);
@@ -58,9 +63,9 @@ const genAnnounceRequest = () => {
     buf.writeBigUInt64BE(left, 64); // left
     buf.writeBigUInt64BE(0n, 72); // uploaded
     buf.writeUInt32BE(0, 80); // event   0 // 0: none; 1: completed; 2: started; 3: stopped
-    buf.writeUInt32BE(0, 84); // IP address 0 // default
+    buf.writeUInt32BE(0, 84); // IP address   0 // default
     buf.writeUint32BE(key, 88);
-    buf.writeInt32BE(-1, 92); // num_want  -1 // default
+    buf.writeInt32BE(-1, 92); // num_want   -1 // default
     buf.writeUint16BE(PORT, 96);
 
     return buf;
@@ -77,6 +82,8 @@ server.on('error', (err) => {
 });
 
 server.on('message', (msg, rinfo) => {
+    clearInterval(findingUrlInterval);
+    console.log(`Found working url: ${currentAnnounceUrl}`);
     console.log(`server got: ${msg} of length ${msg.length} from ${rinfo.address}:${rinfo.port}`);
 
     const action = msg.readUint32BE(0);
@@ -91,10 +98,10 @@ server.on('message', (msg, rinfo) => {
             connectionId = connId;
             console.log(connectionId);
 
-            server.send(genAnnounceRequest(), parseInt(announceUrl.port), announceUrl.hostname, () => {
+            server.send(genAnnounceRequest(), parseInt(currentAnnounceUrl.port), currentAnnounceUrl.hostname, () => {
                 console.log("Sent announce request.");
-                console.log(announceUrl.hostname);
-                console.log(announceUrl.port);
+                console.log(currentAnnounceUrl.hostname);
+                console.log(currentAnnounceUrl.port);
             })
 
             break;
@@ -106,11 +113,17 @@ server.on('message', (msg, rinfo) => {
 
             const peers = [];
 
-            for(let offset = 20; offset < msg.length; offset += 6){
-                const peerIpAdd = msg.readUint32BE(offset);
+            for (let offset = 20; offset + 6 <= msg.length; offset += 6) {
+                // const peerIpAdd = msg.readUint32BE(offset);
+                const peerIpAdd = [
+                    msg[offset],
+                    msg[offset + 1],
+                    msg[offset + 2],
+                    msg[offset + 3]
+                ].join(".");
                 const peerTcpPort = msg.readUint16BE(offset + 4);
 
-                peers.push({peerIpAdd, peerTcpPort});
+                peers.push({ ip: peerIpAdd, port: peerTcpPort });
             }
 
             console.log(peers);
@@ -124,9 +137,31 @@ server.on('listening', () => {
     console.log(`server listening ${address.address}:${address.port}`);
 });
 
+// for(const announceUrl of announceUrlList){
+//     server.send(genConnectionRequest(), parseInt(decodedAnnounceUrl.port), decodedAnnounceUrl.hostname, () => {
+//         console.log("Sent connection request.");
+//         console.log(decodedAnnounceUrl.hostname);
+//         console.log(decodedAnnounceUrl.port);
+//     })
+// }
 
-server.send(genConnectionRequest(), parseInt(announceUrl.port), announceUrl.hostname, () => {
-    console.log("Sent connection request.");
-    console.log(announceUrl.hostname);
-    console.log(announceUrl.port);
-})
+let currentAnnounceUrlIndex = -1;
+let currentAnnounceUrl: URL;
+
+const findingUrlInterval = setInterval(() => {
+    currentAnnounceUrl = announceUrlList[++currentAnnounceUrlIndex];
+    if (currentAnnounceUrl) {
+        transactionId = crypto.randomBytes(4).readUInt32BE(0);
+        server.send(genConnectionRequest(transactionId), parseInt(currentAnnounceUrl.port), currentAnnounceUrl.hostname, () => {
+            console.log("Sent connection request.");
+            console.log(currentAnnounceUrl.hostname);
+            console.log(currentAnnounceUrl.port);
+        })
+    }else if(currentAnnounceUrlIndex >= announceUrlList.length){
+        clearInterval(findingUrlInterval);
+        console.log("No working URL");
+        return;
+    }else{
+        console.log("Invalid announce url, trying next...");
+    }
+}, 1000)
