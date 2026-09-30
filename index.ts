@@ -2,13 +2,20 @@ import { file } from "bun";
 import crypto from "crypto";
 import dgram from "dgram";
 import * as bencode from "./bencode";
-import { PROTOCOL_ID } from "./constants";
+import { PROTOCOL_ID, PROTOCOL_STRING } from "./constants";
+import { download } from "./src/download";
+
+interface IPeer {
+    ip: string;
+    port: number;
+}
+
 
 const torrentFile = file("./test.torrent");
-
 const bytes = new Uint8Array(await torrentFile.arrayBuffer());
-
 const decoded = bencode.decode(bytes);
+const infoBytes = bencode.encode(decoded.info);
+const infoHash = crypto.createHash("sha1").update(infoBytes).digest();
 
 
 const decodedAnnounceUrl = new URL(decoded.announce);
@@ -23,7 +30,21 @@ let transactionId: number;
 const key = crypto.randomBytes(4).readUInt32BE(0);
 let connectionId: bigint;
 
-const genConnectionRequest = (tId: number) => {
+export function genHandshakeRequest() {
+    const bufLen = 49 + PROTOCOL_STRING.length;
+    const buf = Buffer.alloc(bufLen);
+    const peerId = crypto.randomBytes(20);
+    
+    buf.writeUInt8(PROTOCOL_STRING.length, 0); // 1 byte
+    buf.write(PROTOCOL_STRING, 1); // 19 bytes
+    // reserved bytes - 8 bytes
+    infoHash.copy(buf, 28);
+    peerId.copy(buf, 48);
+    
+    return buf;
+}
+
+function genConnectionRequest(tId: number) {
     const buf = Buffer.alloc(16);
     buf.writeBigUInt64BE(PROTOCOL_ID, 0);
     buf.writeUInt32BE(0, 8); // announce   0 // 0: connect
@@ -31,9 +52,7 @@ const genConnectionRequest = (tId: number) => {
     return buf;
 }
 
-const genAnnounceRequest = () => {
-    const infoBytes = bencode.encode(decoded.info);
-    const infoHash = crypto.createHash("sha1").update(infoBytes).digest();
+function genAnnounceRequest() {
     // console.log(infoHash);
 
 
@@ -70,8 +89,6 @@ const genAnnounceRequest = () => {
 
     return buf;
 }
-
-
 
 const server = dgram.createSocket("udp4");
 server.bind(PORT);
@@ -111,7 +128,7 @@ server.on('message', (msg, rinfo) => {
             const leechers = msg.readUint32BE(12);
             const seeders = msg.readUint32BE(16);
 
-            const peers = [];
+            const peers: IPeer[] = [];
 
             for (let offset = 20; offset + 6 <= msg.length; offset += 6) {
                 // const peerIpAdd = msg.readUint32BE(offset);
@@ -127,7 +144,12 @@ server.on('message', (msg, rinfo) => {
             }
 
             console.log(peers);
-
+            if(peers.length > 0){
+                peers.map((peer) => {
+                    download(peer);
+                })
+            }
+            
             break;
     }
 });
@@ -136,14 +158,6 @@ server.on('listening', () => {
     const address = server.address();
     console.log(`server listening ${address.address}:${address.port}`);
 });
-
-// for(const announceUrl of announceUrlList){
-//     server.send(genConnectionRequest(), parseInt(decodedAnnounceUrl.port), decodedAnnounceUrl.hostname, () => {
-//         console.log("Sent connection request.");
-//         console.log(decodedAnnounceUrl.hostname);
-//         console.log(decodedAnnounceUrl.port);
-//     })
-// }
 
 let currentAnnounceUrlIndex = -1;
 let currentAnnounceUrl: URL;
@@ -157,11 +171,11 @@ const findingUrlInterval = setInterval(() => {
             console.log(currentAnnounceUrl.hostname);
             console.log(currentAnnounceUrl.port);
         })
-    }else if(currentAnnounceUrlIndex >= announceUrlList.length){
+    } else if (currentAnnounceUrlIndex >= announceUrlList.length) {
         clearInterval(findingUrlInterval);
         console.log("No working URL");
         return;
-    }else{
+    } else {
         console.log("Invalid announce url, trying next...");
     }
 }, 1000)
